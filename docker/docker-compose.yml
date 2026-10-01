@@ -10,8 +10,8 @@ services:
       interval: 2s
       timeout: 5s
       retries: 30
-    ports:
-      - "5432:5432"
+    # ports:
+    #   - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
 
@@ -28,7 +28,7 @@ services:
     # pids_limit is the backstop: if something ever does leak processes again,
     # this container hits its own ceiling and dies visibly rather than starving
     # the whole host of pids.
-    pids_limit: 2048
+    # pids_limit: 2048
     ports:
       - "3100:3100"
     env_file:
@@ -50,6 +50,7 @@ services:
       resources:
         limits:
           cpus: 3
+          pids: 2048
           # memory: 3G
 
 volumes:
