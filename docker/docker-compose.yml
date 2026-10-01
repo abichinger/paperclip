@@ -16,9 +16,10 @@ services:
       - pgdata:/var/lib/postgresql/data
 
   server:
-    build:
-      context: ..
-      dockerfile: Dockerfile
+    image: abichinger/paperclip:latest
+    # build:
+    #   context: ..
+    #   dockerfile: Dockerfile
     # No `init: true` here on purpose. The image makes tini PID 1 itself
     # (Dockerfile ENTRYPOINT), which covers every launch path -- compose, plain
     # `docker run`, the quadlet units and the ECS task definition -- instead of
@@ -30,6 +31,8 @@ services:
     pids_limit: 2048
     ports:
       - "3100:3100"
+    env_file:
+      - .env
     environment:
       DATABASE_URL: postgres://paperclip:paperclip@db:5432/paperclip
       PORT: "3100"
@@ -43,6 +46,11 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: 3
+          # memory: 3G
 
 volumes:
   pgdata:
