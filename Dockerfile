@@ -159,6 +159,160 @@ RUN mkdir -p /provider-pack \
     echo "Skipping remote provider pack: supply a full PAPERCLIP_BUILD_COMMIT to enable remote OpenCode/ACPX execution"; \
   fi
 
+# Android + Flutter toolchain for mobile client work.
+#
+# A separate stage, not a `production` RUN, for two cache reasons. This payload
+# is ~3.4 GB and downloads from four independent upstreams, so it wants a layer
+# cache entry that neither the weekly CLI_TOOLS_CACHE_EPOCH bump above nor an
+# app-source commit can invalidate. It also copies nothing from the build
+# context, so it keys purely on the pins below; `production` COPYs the trees in.
+#
+# Unlike the CLI toolchain, nothing here is `@latest` and nothing here is
+# weekly-moving, so it deliberately does NOT take the CLI_TOOLS_CACHE_EPOCH
+# stamp. Its cache key is the pins, which is the stronger guarantee: bump a
+# version, and exactly one tool re-downloads.
+FROM base AS mobile-toolchain
+# Escape hatch, not a default. Self-hosted images and CI that never touch a
+# mobile client should not pay ~3.4 GB for this stage, so
+# `--build-arg WITH_MOBILE_TOOLCHAIN=0` produces the previous lean image. The
+# stage still creates the four empty /opt trees, so the COPYs in `production`
+# stay unconditional and the resulting digest stays stable.
+ARG WITH_MOBILE_TOOLCHAIN=1
+# Temurin 17 rather than Debian's openjdk-17: the base is
+# node:24-trixie-slim (Debian 13), whose main archive ships openjdk-21 and
+# openjdk-25 but no openjdk-17-jdk-headless package, so that option does not
+# exist for this base. 17 is the right floor anyway: AGP 8.x and AGP 9.x both
+# accept JDK 17, and it is the newest JDK every AGP a client can plausibly use
+# is tested against. RELEASE is the release tag, VERSION the asset filename
+# suffix; the two differ only in how the '+' is written.
+ARG TEMURIN_RELEASE=17.0.20.1+1
+ARG TEMURIN_VERSION=17.0.20.1_1
+ARG TEMURIN_SHA256_AMD64=3808d1d15e3ec6bd5b84057fb5d84c33d8a1536a258146bcea2e603fc726e08e
+ARG TEMURIN_SHA256_ARM64=457b57af8f9c93ec39080bb8c764f559dc8c89a6da1a39d718a400b7890d3e41
+# Android command-line tools 19.0 (archive build 13114758).
+#
+# 19.0, not the newest 23.0: from 20.0 onward `sdkmanager` is a shim over the
+# new `android` CLI, prints "The --licenses option is no longer needed", and
+# `flutter doctor` then reports "Android license status unknown" instead of
+# reading the pre-accepted license files. Verified both ways against Flutter
+# 3.47.6: 23.0 fails the license check, 19.0 reports "All Android licenses
+# accepted".
+#
+# Google publishes only a SHA-1 for this archive (the value below is straight
+# out of dl.google.com/android/repository/repository2-1.xml). SHA-256 is
+# checked instead, and the published SHA-1 is verified during the build, so the
+# pin is anchored to Google's own metadata *and* stronger than it.
+ARG ANDROID_CMDLINE_TOOLS_BUILD=13114758
+ARG ANDROID_CMDLINE_TOOLS_SHA1=5fdcc763663eefb86a5b8879697aa6088b041e70
+ARG ANDROID_CMDLINE_TOOLS_SHA256=7ec965280a073311c339e571cd5de778b9975026cfcbe79f2b1cdcb1e15317ee
+# One platform + one build-tools, matching major versions. 36 is not a guess:
+# Flutter 3.47.6's own gradle_utils.dart declares `compileSdkVersionInt = 36`,
+# so a stock `flutter create` app compiles against exactly this platform. SDK
+# components are not fetched by Gradle, so exactly one usable set has to be
+# present; anything else the client declares is a one-ARG change here.
+ARG ANDROID_SDK_PLATFORM=android-36
+ARG ANDROID_BUILD_TOOLS=36.1.0
+# The NDK is NOT baked by default, and the reason is size: r28c alone is
+# ~2.4 GB extracted, which would more than double the stage. A Flutter project
+# is still buildable without it, because AGP auto-provisions the NDK from the
+# pre-accepted licenses above on first build — so this is a network-at-first-
+# build cost, not a capability gap. Set `--build-arg
+# ANDROID_SDK_NDK=28.1.13356709` (the version Flutter 3.47.6's template
+# resolves to) for a fully offline-capable loop.
+ARG ANDROID_SDK_NDK=""
+# Gradle 9.3.1 — the version Flutter 3.47.6 writes into a generated project's
+# gradle-wrapper.properties. Deliberately 9.x, not 8.x: AGP 9.1.0 (the version
+# the same template pins) rejects Gradle 8, so an 8.x system gradle could not
+# drive a stock Flutter project at all. This is a convenience `gradle` for
+# scratch work; a real client build should use ./gradlew, which fetches the
+# version the project pins, so this pin can never silently downgrade a build.
+ARG GRADLE_VERSION=9.3.1
+ARG GRADLE_SHA256=b266d5ff6b90eada6dc3b20cb090e3731302e553a27c5d3e4df1f0d76beaff06
+# Flutter stable. Verified against Google's own release manifest
+# (flutter_infra_release/releases/releases_linux.json), which publishes the
+# SHA-256 for each archive, so this pin is not self-asserted.
+#
+# Flutter publishes stable Linux archives for x86_64 only. On an arm64 build
+# this stage logs why and leaves /opt/flutter empty; the JDK, Android SDK and
+# Gradle halves are unaffected, because those upstream projects do ship arm64.
+ARG FLUTTER_VERSION=3.47.6
+ARG FLUTTER_SHA256=f1631b9c2c8b3529323db412b0d1beacf4a748f8783b0d7cf599a8fd5f461675
+RUN set -eux; \
+    mkdir -p /opt/jdk /opt/android-sdk /opt/gradle /opt/flutter; \
+    if [ "$WITH_MOBILE_TOOLCHAIN" != "1" ]; then \
+      echo "WITH_MOBILE_TOOLCHAIN=$WITH_MOBILE_TOOLCHAIN: skipping the Flutter + Android toolchain"; \
+      exit 0; \
+    fi; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) jdkTriple="x64" ;; \
+      arm64) jdkTriple="aarch64" ;; \
+      *) echo "ERROR: unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends unzip xz-utils; \
+    rm -rf /var/lib/apt/lists/*; \
+    jdkSha="$TEMURIN_SHA256_AMD64"; \
+    if [ "$arch" = "arm64" ]; then jdkSha="$TEMURIN_SHA256_ARM64"; fi; \
+    jdkTag="$(printf '%s' "$TEMURIN_RELEASE" | sed 's/+/%2B/g')"; \
+    curl -fsSLo /tmp/jdk.tar.gz "https://github.com/adoptium/temurin17-binaries/releases/download/jdk-${jdkTag}/OpenJDK17U-jdk_${jdkTriple}_linux_hotspot_${TEMURIN_VERSION}.tar.gz"; \
+    echo "${jdkSha}  /tmp/jdk.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/jdk.tar.gz -C /opt/jdk --strip-components=1; \
+    rm /tmp/jdk.tar.gz; \
+    export JAVA_HOME=/opt/jdk ANDROID_HOME=/opt/android-sdk ANDROID_SDK_ROOT=/opt/android-sdk; \
+    export PATH="$JAVA_HOME/bin:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"; \
+    java -version; \
+    curl -fsSLo /tmp/cmdline-tools.zip "https://dl.google.com/android/repository/commandlinetools-linux-${ANDROID_CMDLINE_TOOLS_BUILD}_latest.zip"; \
+    echo "${ANDROID_CMDLINE_TOOLS_SHA256}  /tmp/cmdline-tools.zip" | sha256sum -c -; \
+    echo "${ANDROID_CMDLINE_TOOLS_SHA1}  /tmp/cmdline-tools.zip" | sha1sum -c -; \
+    unzip -q /tmp/cmdline-tools.zip -d /opt/android-sdk/cmdline-tools; \
+    rm /tmp/cmdline-tools.zip; \
+    mv /opt/android-sdk/cmdline-tools/cmdline-tools /opt/android-sdk/cmdline-tools/latest; \
+    sdkmanager --version; \
+    mkdir -p "$ANDROID_HOME/licenses"; \
+    printf '%s' 24333f8a63b6825ea9c5514f83c2829b004d1fee > "$ANDROID_HOME/licenses/android-sdk-license"; \
+    printf '%s' 84831b9409646a918e30573bab4c9c91346d8abd > "$ANDROID_HOME/licenses/google-gdk-license"; \
+    printf '%s' 601085b94cd77f0b54ff86406957099ebe79c4d6 > "$ANDROID_HOME/licenses/android-googletv-license"; \
+    printf '%s' ceff83576aac4f7f37cb98fe189e9fb3c49d3b81 > "$ANDROID_HOME/licenses/android-googlexr-license"; \
+    printf '%s' 859f317696f67ef3d7f30a50a5560e7834b43903 > "$ANDROID_HOME/licenses/android-sdk-arm-dbt-license"; \
+    printf '%s' e9acab5b5fbb560a72cfaecce8946896ff6aab9d > "$ANDROID_HOME/licenses/mips-android-sysimage-license"; \
+    printf '%s' 33b6a2b64607f11b759f320ef9dff4ae5c47d97a > "$ANDROID_HOME/licenses/android-sdk-preview-license"; \
+    yes | sdkmanager --licenses > /dev/null; \
+    sdkPackages="platform-tools platforms;${ANDROID_SDK_PLATFORM} build-tools;${ANDROID_BUILD_TOOLS}"; \
+    if [ -n "$ANDROID_SDK_NDK" ]; then sdkPackages="$sdkPackages ndk;$ANDROID_SDK_NDK"; fi; \
+    sdkmanager --install $sdkPackages; \
+    curl -fsSLo /tmp/gradle.zip "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"; \
+    echo "${GRADLE_SHA256}  /tmp/gradle.zip" | sha256sum -c -; \
+    unzip -q /tmp/gradle.zip -d /opt/gradle; \
+    rm /tmp/gradle.zip; \
+    ln -s "gradle-${GRADLE_VERSION}" /opt/gradle/current; \
+    gradle --version; \
+    if [ "$arch" = "amd64" ]; then \
+      curl -fsSLo /tmp/flutter.tar.xz "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${FLUTTER_VERSION}-stable.tar.xz"; \
+      echo "${FLUTTER_SHA256}  /tmp/flutter.tar.xz" | sha256sum -c -; \
+      tar -xJf /tmp/flutter.tar.xz -C /opt; \
+      rm /tmp/flutter.tar.xz; \
+      export FLUTTER_ROOT=/opt/flutter; \
+      export PATH="$FLUTTER_ROOT/bin:$PATH"; \
+      flutter config --no-analytics > /dev/null; \
+      flutter --version; \
+      flutter precache --android; \
+    else \
+      echo "WARNING: $arch has no published stable Flutter Linux archive; skipping Flutter"; \
+    fi; \
+    ln -s "$ANDROID_BUILD_TOOLS" "$ANDROID_HOME/build-tools/current"; \
+    sdkmanager --list_installed; \
+    adb version; \
+    aapt2 version; \
+    chown -R node:node /opt/android-sdk /opt/gradle /opt/flutter
+# The agent half of the image runs as `node` (see the entrypoint's gosu drop),
+# and both of these trees are written at run time — sdkmanager installs extra
+# components, AGP auto-provisions them, and flutter writes into
+# $FLUTTER_ROOT/bin/cache on every invocation. Root-owned, all three fail with
+# EACCES. Handing them to the user that actually builds against them is not a
+# privilege change: `node` can already run arbitrary code, and nothing in the
+# entrypoint executes anything out of these trees as root.
+
 FROM base AS production
 ARG USER_UID=1000
 ARG USER_GID=1000
@@ -174,10 +328,22 @@ WORKDIR /app
 RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest @moonshot-ai/kimi-code@latest \
   && apt-get update \
-  && apt-get install -y --no-install-recommends openssh-client jq \
+  && apt-get install -y --no-install-recommends openssh-client jq unzip \
   && rm -rf /var/lib/apt/lists/* \
   && mkdir -p /paperclip \
   && chown node:node /paperclip
+
+# Mobile toolchain trees, still ahead of the app copy below so their ~3.4 GB
+# keys only on the pins in the `mobile-toolchain` stage and never on app
+# source. `unzip` above is not incidental: flutter shells out to it to unpack
+# engine artifacts on every build, so a flutter-only container without it fails
+# with "Missing 'unzip' tool" long before it reaches anything of its own.
+# Empty trees when that stage ran with WITH_MOBILE_TOOLCHAIN=0, which keeps
+# these four lines unconditional and therefore keeps the digest stable.
+COPY --from=mobile-toolchain /opt/jdk /opt/jdk
+COPY --from=mobile-toolchain /opt/android-sdk /opt/android-sdk
+COPY --from=mobile-toolchain /opt/gradle /opt/gradle
+COPY --from=mobile-toolchain /opt/flutter /opt/flutter
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
@@ -202,6 +368,17 @@ ENV PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH=/opt/paperclip-runner/provider-pa
 # Empty for local builds, preserving the server's normal version fallbacks.
 ARG PAPERCLIP_BUILD_VERSION=""
 ARG PAPERCLIP_BUILD_COMMIT=""
+# Every value here is a literal or an already-expanded $PATH — no ARG is
+# referenced, so declaring these now cannot invalidate the cached tool layers
+# the way a per-build ARG would. The two "current" symlinks exist precisely so
+# this needs no build ARG of its own: the version on PATH is the version the
+# `mobile-toolchain` stage installed, with no second pin to drift out of sync.
+ENV JAVA_HOME=/opt/jdk \
+    ANDROID_HOME=/opt/android-sdk \
+    ANDROID_SDK_ROOT=/opt/android-sdk \
+    FLUTTER_ROOT=/opt/flutter \
+    GRADLE_HOME=/opt/gradle/current \
+    PATH=/opt/jdk/bin:/opt/flutter/bin:/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-sdk/platform-tools:/opt/android-sdk/build-tools/current:/opt/gradle/current/bin:$PATH
 ENV NODE_ENV=production \
   HOME=/paperclip \
   HOST=0.0.0.0 \
